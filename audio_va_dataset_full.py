@@ -132,27 +132,28 @@ class AudioVADataset(Dataset):
     def _parse_video_id_from_csv(self, csv_path: Path) -> Tuple[str, str, str]:
         """
         Extract video info from CSV filename
-        CSV format: front_angry_level_1_emotion_data.csv
-        
+        Handles multi-part directions like left_30, right_60, etc.
+        CSV format: front_angry_level_1_emotion_data.csv, left_30_angry_level_2_emotion_data.csv, etc.
+
         Returns: (direction, emotion, level)
         """
-        # Get CSV filename: e.g., "front_angry_level_1_emotion_data.csv"
         csv_filename = csv_path.stem  # Remove .csv extension
-        
-        # Parse format: front_angry_level_1_emotion_data
-        # Pattern: {direction}_{emotion}_{level}_emotion_data
         parts = csv_filename.replace('_emotion_data', '').split('_')
-        
-        if len(parts) >= 3:
-            direction = parts[0]  # "front"
-            emotion = parts[1]     # "angry"
-            level = '_'.join(parts[2:])  # "level_1" (handle multi-part levels)
+
+        # Handle multi-part directions like left_30, right_60, etc.
+        if len(parts) >= 4 and parts[1].isdigit():
+            direction = f"{parts[0]}_{parts[1]}"  # e.g., left_30
+            emotion = parts[2]
+            level = '_'.join(parts[3:])  # e.g., level_2
+        elif len(parts) >= 3:
+            direction = parts[0]
+            emotion = parts[1]
+            level = '_'.join(parts[2:])
         else:
-            # Fallback
             direction = "unknown"
             emotion = "unknown"
             level = "level_1"
-        
+
         return direction, emotion, level
     
     def _build_dataset_index(self) -> List[Dict]:
