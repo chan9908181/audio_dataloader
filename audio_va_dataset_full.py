@@ -1,8 +1,9 @@
 """
-DataLoader for Audio-based Valence-Arousal Extraction with Sliding Window
+DataLoader for Audio-based Valence-Arousal Extraction with Full Audio
 Uses EMOCA image-based predictions as ground truth labels (from CSV files)
-Extracts 1-second audio windows (0.5s before + 0.5s after) for EVERY frame
+Extracts FULL audio files and computes AVERAGE VA across all frames
 Searches directory for multiple CSV files (all directions)
+One sample per CSV file
 """
 
 import torch
@@ -28,9 +29,10 @@ except (AttributeError, RuntimeError):
 
 class AudioVADataset(Dataset):
     """
-    Dataset for training audio-based VA extraction with sliding window
-    Ground truth: EMOCA image-based VA predictions from CSV files (interpolated for all frames)
-    Input: 1-second audio windows centered on each frame
+    Dataset for training audio-based VA extraction with full audio
+    Ground truth: EMOCA image-based VA predictions from CSV files (averaged across all frames)
+    Input: Full audio file (entire recording)
+    Output: Average valence and arousal across all frames in the CSV
     """
     
     def __init__(
@@ -39,13 +41,9 @@ class AudioVADataset(Dataset):
         audio_base_dir: str,  # Base audio directory (e.g., /home/chan9/Continuous-EMOTE/audio)
         sequence_num: str = "001",  # Audio sequence number: "001", "002", etc.
         direction_filter: Optional[str] = None,  # Optional: Only load CSVs with this direction
-        fps: int = 30,
         audio_sample_rate: int = 16000,
-        window_duration: float = 1.0,  # Total window in seconds
         target_sample_rate: Optional[int] = None,
-        mode: str = 'train',
-        interpolate_va: bool = True,  # Interpolate VA for frames between annotations
-        use_all_frames: bool = True  # Generate samples for all frames, not just annotated ones
+        mode: str = 'train'
     ):
         """
         Args:
@@ -53,30 +51,17 @@ class AudioVADataset(Dataset):
             audio_base_dir: Base audio directory (e.g., /path/to/audio)
             sequence_num: Audio sequence number (e.g., "001", "002", "003" for 001.m4a, 002.m4a, etc.)
             direction_filter: Optional - Only load CSVs matching this direction (e.g., "front", "down", etc.). If None, loads all directions.
-            fps: Video frames per second
             audio_sample_rate: Original audio sample rate
-            window_duration: Total audio window duration (default 1.0s)
             target_sample_rate: Resample audio to this rate (None = keep original)
             mode: 'train', 'val', or 'test'
-            interpolate_va: Whether to interpolate VA values for frames between annotations
-            use_all_frames: If True, generate samples for ALL frames using sliding window
         """
         self.audio_base_dir = Path(audio_base_dir)
         self.csv_dir = Path(csv_dir)
         self.sequence_num = sequence_num
         self.direction_filter = direction_filter.lower() if direction_filter else None
-        self.fps = fps
         self.audio_sample_rate = audio_sample_rate
         self.target_sample_rate = target_sample_rate or audio_sample_rate
-        self.window_duration = window_duration
-        self.half_window_duration = window_duration / 2.0
         self.mode = mode
-        self.interpolate_va = interpolate_va
-        self.use_all_frames = use_all_frames
-        
-        # Calculate samples per window
-        self.samples_per_window = int(self.target_sample_rate * self.window_duration)
-        self.half_window_samples = self.samples_per_window // 2
         
         # Find all CSV files in directory
         self.csv_files = self._find_csv_files()
@@ -159,8 +144,7 @@ class AudioVADataset(Dataset):
     def _build_dataset_index(self) -> List[Dict]:
         """
         Build index of all samples from all CSV files
-        If use_all_frames=True: Generate samples for EVERY frame using sliding window
-        Otherwise: One sample per CSV row
+        One sample per CSV file: full audio + average VA
         """
         all_samples = []
         
@@ -185,113 +169,49 @@ class AudioVADataset(Dataset):
             
             print(f"  Using audio: {audio_path.name}")
             
-            # Get audio duration
-            try:
-                try:
-                    audio_info = torchaudio.info(str(audio_path))
-                    audio_duration = audio_info.num_frames / audio_info.sample_rate
-                    total_frames = int(audio_duration * self.fps)
-                except RuntimeError:
-                    # Fallback: Use ffprobe to get duration
-                    result = subprocess.run(
-                        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                         '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)],
-                        capture_output=True, text=True
-                    )
-                    audio_duration = float(result.stdout.strip())
-                    total_frames = int(audio_duration * self.fps)
-            except Exception as e:
-                print(f"  WARNING: Error loading audio: {e}, skipping...")
-                continue
+            # Calculate average VA across all valid rows in CSV
+            valid_valences = []
+            valid_arousals = []
+            expressions = []
             
-            # Build frame annotations dictionary
-            frames_dict = {}
             for idx, row in df.iterrows():
-                frame_idx = self._parse_frame_number(row['image_name'])
-                if frame_idx is None or pd.isna(row['valence']) or pd.isna(row['arousal']):
-                    continue
-                
-                frames_dict[frame_idx] = {
-                    'valence': float(row['valence']),
-                    'arousal': float(row['arousal']),
-                    'expression': row.get('expression', 'unknown'),
-                    'image_name': str(row['image_name'])
-                }
+                if pd.notna(row['valence']) and pd.notna(row['arousal']):
+                    valid_valences.append(float(row['valence']))
+                    valid_arousals.append(float(row['arousal']))
+                    if 'expression' in row and pd.notna(row['expression']):
+                        expressions.append(str(row['expression']))
             
-            if len(frames_dict) == 0:
-                print(f"  WARNING: No valid frames found, skipping...")
+            if len(valid_valences) == 0:
+                print(f"  WARNING: No valid VA annotations found, skipping...")
                 continue
             
-            # Generate samples
-            if self.use_all_frames:
-                # SLIDING WINDOW: Generate samples for ALL frames
-                min_frame = min(frames_dict.keys())
-                max_frame = max(frames_dict.keys())
-                
-                # Interpolate VA values for all frames
-                frame_indices = sorted(frames_dict.keys())
-                valences = [frames_dict[f]['valence'] for f in frame_indices]
-                arousals = [frames_dict[f]['arousal'] for f in frame_indices]
-                
-                for frame_idx in range(min_frame, min(max_frame + 1, total_frames)):
-                    # Calculate frame time and audio window bounds
-                    frame_time = frame_idx / self.fps
-                    window_start_time = frame_time - self.half_window_duration
-                    window_end_time = frame_time + self.half_window_duration
-                    
-                    # Skip frames where the window would require padding
-                    if window_start_time < 0 or window_end_time > audio_duration:
-                        continue
-                    
-                    # Interpolate VA for this frame
-                    if self.interpolate_va and frame_idx not in frames_dict:
-                        valence = np.interp(frame_idx, frame_indices, valences)
-                        arousal = np.interp(frame_idx, frame_indices, arousals)
-                        expression = 'interpolated'
-                        image_name = f"{frame_idx * 100:08d}"
-                    else:
-                        # Use exact annotation
-                        if frame_idx in frames_dict:
-                            valence = frames_dict[frame_idx]['valence']
-                            arousal = frames_dict[frame_idx]['arousal']
-                            expression = frames_dict[frame_idx]['expression']
-                            image_name = frames_dict[frame_idx]['image_name']
-                        else:
-                            continue
-                    
-                    all_samples.append({
-                        'video_id': video_id,
-                        'frame_idx': frame_idx,
-                        'valence': valence,
-                        'arousal': arousal,
-                        'expression': expression,
-                        'audio_path': audio_path,
-                        'total_frames': total_frames,
-                        'image_name': image_name,
-                        'direction': direction,
-                        'emotion_category': emotion,
-                        'level': level
-                    })
-            else:
-                # NO SLIDING WINDOW: Only annotated frames
-                for frame_idx, frame_data in frames_dict.items():
-                    all_samples.append({
-                        'video_id': video_id,
-                        'frame_idx': frame_idx,
-                        'valence': frame_data['valence'],
-                        'arousal': frame_data['arousal'],
-                        'expression': frame_data['expression'],
-                        'audio_path': audio_path,
-                        'total_frames': total_frames,
-                        'image_name': frame_data['image_name'],
-                        'direction': direction,
-                        'emotion_category': emotion,
-                        'level': level
-                    })
+            # Compute averages
+            avg_valence = float(np.mean(valid_valences))
+            avg_arousal = float(np.mean(valid_arousals))
             
-            print(f"  Generated {len(all_samples) - len([s for s in all_samples if s['video_id'] != video_id])} samples for this video")
+            # Get most common expression (if available)
+            if expressions:
+                from collections import Counter
+                most_common_expression = Counter(expressions).most_common(1)[0][0]
+            else:
+                most_common_expression = 'unknown'
+            
+            # Create one sample per CSV (full audio + average VA)
+            all_samples.append({
+                'video_id': video_id,
+                'valence': avg_valence,
+                'arousal': avg_arousal,
+                'expression': most_common_expression,
+                'audio_path': audio_path,
+                'direction': direction,
+                'emotion_category': emotion,
+                'level': level,
+                'num_frames': len(valid_valences)
+            })
+            
+            print(f"  Average VA: valence={avg_valence:.3f}, arousal={avg_arousal:.3f} (from {len(valid_valences)} frames)")
         
-        print(f"\nTotal samples across all CSVs: {len(all_samples)}")
+        print(f"\nTotal samples (CSV files): {len(all_samples)}")
         return all_samples
     
     def _find_audio_file(self, emotion: str, level: str, sequence_num: str) -> Optional[Path]:
@@ -314,20 +234,13 @@ class AudioVADataset(Dataset):
         
         return None
     
-    def _extract_audio_window(
-        self, 
-        audio_path: Path, 
-        frame_idx: int, 
-        total_frames: int
-    ) -> torch.Tensor:
+    def _load_full_audio(self, audio_path: Path) -> torch.Tensor:
         """
-        Extract 1-second audio window centered on frame_idx
+        Load the full audio file
         Args:
             audio_path: Path to audio file
-            frame_idx: Target frame index
-            total_frames: Total number of frames in video
         Returns:
-            Audio tensor of shape (samples_per_window,)
+            Audio tensor of shape (num_samples,) - full audio
         """
         # Load full audio - use ffmpeg to convert m4a to wav first
         try:
@@ -356,32 +269,12 @@ class AudioVADataset(Dataset):
         if sr != self.target_sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.target_sample_rate)
             waveform = resampler(waveform)
-            sr = self.target_sample_rate
         
         # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
         
-        # Calculate center sample position
-        frame_time = frame_idx / self.fps
-        center_sample = int(frame_time * sr)
-        
-        # Calculate window bounds
-        start_sample = center_sample - self.half_window_samples
-        end_sample = center_sample + self.half_window_samples
-        
-        # Extract audio window (no padding needed since we filter frames during dataset building)
-        audio_window = waveform[:, start_sample:end_sample]
-        
-        # Ensure exact length (handle rounding errors)
-        if audio_window.shape[1] != self.samples_per_window:
-            if audio_window.shape[1] < self.samples_per_window:
-                padding = torch.zeros((1, self.samples_per_window - audio_window.shape[1]))
-                audio_window = torch.cat([audio_window, padding], dim=1)
-            else:
-                audio_window = audio_window[:, :self.samples_per_window]
-        
-        return audio_window.squeeze(0)
+        return waveform.squeeze(0)
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -390,43 +283,60 @@ class AudioVADataset(Dataset):
         """
         Returns:
             Dictionary with:
-                - audio: (samples_per_window,) audio window
-                - valence: scalar valence value
-                - arousal: scalar arousal value
-                - frame_idx: frame index
+                - audio: (num_samples,) full audio waveform
+                - valence: scalar average valence value
+                - arousal: scalar average arousal value
                 - video_id: video identifier
-                - expression: expression label
+                - expression: most common expression label
+                - direction: camera direction
+                - emotion_category: emotion category
+                - level: intensity level
         """
         sample = self.samples[idx]
         
-        # Extract audio window
-        audio_window = self._extract_audio_window(
-            sample['audio_path'],
-            sample['frame_idx'],
-            sample['total_frames']
-        )
+        # Load full audio
+        audio = self._load_full_audio(sample['audio_path'])
         
         return {
-            'audio': audio_window,  # (samples_per_window,)
+            'audio': audio,  # (num_samples,) - variable length
             'valence': torch.tensor(sample['valence'], dtype=torch.float32),
             'arousal': torch.tensor(sample['arousal'], dtype=torch.float32),
-            'frame_idx': sample['frame_idx'],
             'video_id': sample['video_id'],
             'expression': sample['expression'],
-            'image_name': sample['image_name']
+            'direction': sample['direction'],
+            'emotion_category': sample['emotion_category'],
+            'level': sample['level'],
+            'num_frames': sample['num_frames']
         }
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Custom collate function for batching"""
+def collate_fn(batch: List[Dict]) -> Dict:
+    """
+    Custom collate function for batching variable-length audio
+    Pads audio to the longest sample in the batch
+    """
+    # Find max length in batch
+    max_length = max(item['audio'].shape[0] for item in batch)
+    
+    # Pad all audio to max length
+    padded_audio = []
+    for item in batch:
+        audio = item['audio']
+        if audio.shape[0] < max_length:
+            padding = torch.zeros(max_length - audio.shape[0])
+            audio = torch.cat([audio, padding])
+        padded_audio.append(audio)
+    
     return {
-        'audio': torch.stack([item['audio'] for item in batch]),
+        'audio': torch.stack(padded_audio),  # (batch, max_length)
         'valence': torch.stack([item['valence'] for item in batch]),
         'arousal': torch.stack([item['arousal'] for item in batch]),
-        'frame_idx': torch.tensor([item['frame_idx'] for item in batch]),
-        'video_id': [item['video_id'] for item in batch],  # Keep as list
-        'expression': [item['expression'] for item in batch],  # Keep as list
-        'image_name': [item['image_name'] for item in batch]  # Keep as list
+        'video_id': [item['video_id'] for item in batch],
+        'expression': [item['expression'] for item in batch],
+        'direction': [item['direction'] for item in batch],
+        'emotion_category': [item['emotion_category'] for item in batch],
+        'level': [item['level'] for item in batch],
+        'num_frames': torch.tensor([item['num_frames'] for item in batch])
     }
 
 
@@ -435,25 +345,23 @@ def create_dataloader(
     audio_base_dir: str,
     sequence_num: str = "001",
     direction_filter: Optional[str] = None,
-    batch_size: int = 32,
+    batch_size: int = 8,
     num_workers: int = 4,
     shuffle: bool = True,
     **dataset_kwargs
 ) -> DataLoader:
     """
-    Create DataLoader for audio VA training with sliding window
+    Create DataLoader for audio VA training with full audio files
     
     Args:
         csv_dir: Directory containing CSV files with EMOCA predictions
         audio_base_dir: Base audio directory (e.g., /home/chan9/Continuous-EMOTE/audio)
         sequence_num: Audio sequence number (e.g., "001" for 001.m4a, "002" for 002.m4a)
         direction_filter: Optional - Only load CSVs matching this direction (e.g., "front", "down", etc.). If None, loads all directions.
-        batch_size: Batch size
+        batch_size: Batch size (smaller recommended due to full audio size)
         num_workers: Number of data loading workers
         shuffle: Whether to shuffle data
         **dataset_kwargs: Additional arguments for AudioVADataset
-            - use_all_frames: If True, use sliding window for all frames
-            - interpolate_va: If True, interpolate VA between annotations
     
     Returns:
         DataLoader instance
@@ -478,19 +386,15 @@ def create_dataloader(
 
 # Example usage
 if __name__ == "__main__":
-    # With sliding window (generates samples for ALL frames from ALL CSVs)
+    # Full audio with average VA (one sample per CSV file)
     train_loader = create_dataloader(
         csv_dir="/home/chan9/Continuous-EMOTE/emotion_csv_extracted",
         audio_base_dir="/home/chan9/Continuous-EMOTE/audio",
-        sequence_num="001",  # Specify which audio file: "001" for 001.m4a, "002" for 002.m4a, etc.
-        direction_filter=None,  # Load all directions (front, down, left, right, etc.)
-        batch_size=16,
-        fps=30,
+        sequence_num="001",  # Use 001.m4a for all emotions
+        direction_filter=None,  # Load all directions
+        batch_size=8,  # Smaller batch size due to full audio
         audio_sample_rate=16000,
-        window_duration=1.0,
-        mode='train',
-        use_all_frames=True,  # SLIDING WINDOW: sample every frame
-        interpolate_va=True   # Interpolate VA for frames between annotations
+        mode='train'
     )
     
     # Test loading
@@ -501,43 +405,33 @@ if __name__ == "__main__":
         print(f"Arousal shape: {batch['arousal'].shape}")
         print(f"Valence range: [{batch['valence'].min():.3f}, {batch['valence'].max():.3f}]")
         print(f"Arousal range: [{batch['arousal'].min():.3f}, {batch['arousal'].max():.3f}]")
-        print(f"Frame indices (first 10): {batch['frame_idx'][:10].tolist()}")
         print(f"Video IDs (first 3): {batch['video_id'][:3]}")
-        print(f"Expressions (first 5): {batch['expression'][:5]}")
+        print(f"Expressions (first 3): {batch['expression'][:3]}")
+        print(f"Directions (first 3): {batch['direction'][:3]}")
+        print(f"Num frames (first 3): {batch['num_frames'][:3].tolist()}")
         break
     
-    # Verify audio window extraction for specific frames
+    # Verify individual samples
     print("\n" + "="*60)
-    print("VERIFICATION: Checking audio window extraction")
+    print("VERIFICATION: Sample details")
     print("="*60)
     
     dataset = train_loader.dataset
-    fps = dataset.fps
-    window_duration = dataset.window_duration
-    
-    # Check first few samples with shuffle=False
-    print(f"\nDataset has {len(dataset)} samples")
-    print(f"FPS: {fps}, Window duration: {window_duration}s")
+    print(f"\nDataset has {len(dataset)} samples (CSV files)")
     
     for i in range(min(5, len(dataset))):
         sample = dataset[i]
-        frame_idx = sample['frame_idx']  # Already an int
-        frame_time = frame_idx / fps
-        window_start = frame_time - window_duration/2
-        window_end = frame_time + window_duration/2
+        audio_duration = sample['audio'].shape[0] / 16000  # Assuming 16kHz
         
         print(f"\nSample {i}:")
-        print(f"  Frame index: {frame_idx}")
-        print(f"  Frame time: {frame_time:.3f}s")
-        print(f"  Audio window: [{window_start:.3f}s, {window_end:.3f}s]")
-        print(f"  Audio shape: {sample['audio'].shape}")
-        print(f"  Expected samples: {int(window_duration * dataset.target_sample_rate)}")
-        print(f"  Valence: {sample['valence'].item():.3f}, Arousal: {sample['arousal'].item():.3f}")
-        
-        # Verify window is within bounds (no padding needed)
-        if window_start < 0:
-            print(f"  ⚠️  WARNING: Window starts before audio (needs padding)")
-        else:
-            print(f"  ✓ Window start is valid (>= 0s)")
+        print(f"  Video ID: {sample['video_id']}")
+        print(f"  Direction: {sample['direction']}")
+        print(f"  Emotion: {sample['emotion_category']}, Level: {sample['level']}")
+        print(f"  Audio duration: {audio_duration:.2f}s")
+        print(f"  Audio samples: {sample['audio'].shape[0]}")
+        print(f"  Average Valence: {sample['valence']:.3f}")
+        print(f"  Average Arousal: {sample['arousal']:.3f}")
+        print(f"  Most common expression: {sample['expression']}")
+        print(f"  Number of frames used: {sample['num_frames']}")
     
     print("\n" + "="*60)
